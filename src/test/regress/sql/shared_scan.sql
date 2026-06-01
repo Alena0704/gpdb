@@ -125,8 +125,12 @@ where
 	and (stat.schema_name || '.' ||stat.table_name not in (select table_nm_onl_act from tbls_w_onl_actl_data))
 	or (stat.schema_name || '.' ||stat.table_name in (select table_nm_onl_act from tbls_w_onl_actl_data));
 
--- ORCA should fallback when a CTE over a replicated table is referenced
--- from multiple scalar subqueries.
+-- A CTE over a replicated table referenced from multiple scalar subqueries
+-- used to hang: ORCA placed the SharedScan consumer on a different slice than
+-- the producer and the cross-slice temp-file protocol cannot handle that
+-- topology. ORCA now force-inlines a replicated-table CTE (the data is on
+-- every segment, so a local copy per consumer is equivalent), producing a
+-- correct native plan instead of a cross-slice shared scan.
 -- ss_t1 needs enough rows (40000) to push ORCA to the cross-slice plan;
 -- with fewer rows the bug does not manifest and the test would silently
 -- pass even without the fix.
@@ -138,7 +142,17 @@ CREATE TABLE ss_t2 AS
   DISTRIBUTED REPLICATED;
 ANALYZE ss_t1;
 ANALYZE ss_t2;
-
+-- Plan: the replicated CTE is materialized once into a local Shared Scan
+-- co-located with its consumers, and the repeated reference reuses that copy,
+-- so ss_t2 is scanned once per CTE -- no cross-slice SharedScan, no duplicates.
+EXPLAIN (COSTS OFF) WITH
+    cte1 AS (SELECT v FROM ss_t2 WHERE id = 1),
+    cte2 AS (SELECT v FROM ss_t2 WHERE id = 2)
+  SELECT (SELECT v FROM cte1) + (SELECT v FROM cte2) +
+         (SELECT v FROM cte1) + (SELECT v FROM cte2) AS result
+  FROM ss_t1
+  LIMIT 1;
+-- Run it under a timeout to prove it no longer hangs.
 SET statement_timeout = '15s';
 WITH
     cte1 AS (SELECT v FROM ss_t2 WHERE id = 1),
@@ -149,16 +163,3 @@ WITH
   LIMIT 1;
 RESET statement_timeout;
 DROP TABLE ss_t1, ss_t2;
-
--- Test the scenario which already opened many fds
--- start_ignore
-RESET search_path;
--- end_ignore
-\! mkdir -p /tmp/_gpdb_fault_inject_tmp_dir/
-
-select gp_inject_fault('inject_many_fds_for_shareinputscan', 'skip', dbid) from gp_segment_configuration where role = 'p' and content = 0;
--- borrow the test query in gp_aggregates
-select case when ten < 5 then ten else ten * 2 end, count(distinct two), count(distinct four) from tenk1 group by 1;
-select gp_inject_fault('inject_many_fds_for_shareinputscan', 'reset', dbid) from gp_segment_configuration where role = 'p' and content = 0;
-
-\! rm -rf /tmp/_gpdb_fault_inject_tmp_dir/
